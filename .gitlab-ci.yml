@@ -1,0 +1,127 @@
+variables:
+  PRIVATE_TEXT: "'PRIVATE-TOKEN:"
+  TOKEN_TEXT: " $TOKEN'"
+  REGION: 'eu-west-2'
+  AWS_SDS_ACCOUNT_ID: '686708285941'
+  IAM_ROLE: arn:aws:iam::${AWS_SDS_ACCOUNT_ID}:role/gitlab-cicd-role
+  REPOSITORY: "core"
+  DOMAIN: "gsaltd"
+  GITLAB_URL: "https://gitlab.gsaltd.uk"
+  PACKAGE: "${CI_PROJECT_TITLE,,}"
+
+default:
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  tags:
+    - docker
+
+stages:
+    - testbuildpush
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Enable Proxy
+# -----------------------------------------------------------------------------------------------------------------------
+.proxy: &proxy
+    - export http_proxy=http://internet.proxy:3128
+    - export https_proxy=http://internet.proxy:3128
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Disable Proxy
+# ----------------------------------------------------------------------------------------------------------------------
+.noproxy: &noproxy
+    - export http_proxy=
+    - export https_proxy=
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Install AWS CLI v2
+# -----------------------------------------------------------------------------------------------------------------------
+.installawscli: &installawscli
+  - apt-get update
+  - apt-get install unzip
+  - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+  - unzip ./awscliv2.zip
+  - ./aws/install
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Install jq JSON processing
+# -----------------------------------------------------------------------------------------------------------------------
+.install_jq: &install_jq
+    - apt-get -q -y install jq
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Login to AWS
+# -----------------------------------------------------------------------------------------------------------------------
+.aws_login: &aws_login
+    - aws sts assume-role --role-arn ${IAM_ROLE} --role-session-name gsa --output json > /tmp/creds
+    - export AWS_ACCESS_KEY_ID=$(cat /tmp/creds |  jq -r ".Credentials.AccessKeyId")
+    - export AWS_SECRET_ACCESS_KEY=$(cat /tmp/creds | jq -r ".Credentials.SecretAccessKey")
+    - export AWS_SESSION_TOKEN=$(cat /tmp/creds | jq -r ".Credentials.SessionToken")
+    - export AWS_ACCOUNT=${AWS_SDS_ACCOUNT_ID}
+    - export AWS_DEFAULT_REGION=${REGION}
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Get Build Number
+# -----------------------------------------------------------------------------------------------------------------------
+.getbuildnumber: &getbuildnumber
+    - GET_INCREMENT_COMMAND="curl --header $PRIVATE_TEXT$TOKEN_TEXT '$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/variables/PATCH_NUMBER' "
+    - INCREMENT_RESULT=$(eval $GET_INCREMENT_COMMAND)
+    - BUILD_INCREMENT=$(echo $INCREMENT_RESULT | jq -r '.value')
+    - LAST_BUILD_TAG="$MAJOR_NUMBER.$MINOR_NUMBER.$PATCH_NUMBER"
+    - echo "Last Build tag was $LAST_BUILD_TAG"
+    - NEW_PATCH_NUMBER=$(($PATCH_NUMBER+1))
+    - NEW_BUILD_TAG="$MAJOR_NUMBER.$MINOR_NUMBER.$NEW_PATCH_NUMBER"
+    - echo "New Build tag is $NEW_BUILD_TAG"
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Connect to CodeArtifact
+# -----------------------------------------------------------------------------------------------------------------------
+.codeartifact: &codeartifact
+    - aws codeartifact get-authorization-token --domain ${DOMAIN} --domain-owner ${AWS_SDS_ACCOUNT_ID} --region ${REGION} --duration-seconds 43200
+    - aws codeartifact login --tool dotnet --repository ${REPOSITORY} --domain ${DOMAIN} --domain-owner ${AWS_SDS_ACCOUNT_ID} --region ${REGION}
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Test
+# -----------------------------------------------------------------------------------------------------------------------
+.test: &test
+    - echo "Testing $PACKAGE Version $NEW_BUILD_TAG"
+    - dotnet test
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Build
+# -----------------------------------------------------------------------------------------------------------------------
+.build: &build
+    - echo "Building $PACKAGE Version $NEW_BUILD_TAG"
+    - "dotnet pack -p:PackageVersion=$NEW_BUILD_TAG"
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Push
+# -----------------------------------------------------------------------------------------------------------------------
+.push: &push
+    - echo "Pushing $PACKAGE Version $NEW_BUILD_TAG to CodeArtifact"
+    - "dotnet nuget push ./src/${CI_PROJECT_TITLE}/bin/Release/*.nupkg --source https://gsaltd-${AWS_SDS_ACCOUNT_ID}.d.codeartifact.eu-west-2.amazonaws.com/nuget/core/v3/index.json"
+
+# -----------------------------------------------------------------------------------------------------------------------
+# Update Build Number
+# -----------------------------------------------------------------------------------------------------------------------
+.updatebuildnumber: &updatebuildnumber
+    - echo "Saving Increment Number as $NEW_PATCH_NUMBER"
+    - UPDATE_COMMAND="curl --request PUT --header $PRIVATE_TEXT$TOKEN_TEXT '$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/variables/PATCH_NUMBER' --form 'value=$NEW_PATCH_NUMBER'"
+    - echo $UPDATE_COMMAND
+    - eval $UPDATE_COMMAND
+
+testbuildpush:
+    stage: testbuildpush
+    before_script:
+    - *proxy
+    - *installawscli
+    - *install_jq
+    - *noproxy
+    - *aws_login
+    - *getbuildnumber    
+    - *proxy
+    - *codeartifact
+    script:
+        - *test
+        - *build
+        - *push
+        - *updatebuildnumber
+
